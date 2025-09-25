@@ -1,0 +1,83 @@
+---
+title: Parameter Guide & Tuning
+alwaysApply: false
+---
+
+# Parameter Guide & Tuning
+
+## Summary
+- This guide summarizes key parameters across the online sampler and learners, practical ranges, and tuning advice.
+- Cross-references defaults shown in `scripts/run_online_trainer.py`.
+
+## Edge-weight parameters (extension ideas; not yet implemented)
+- Backward compatibility: if not provided, all weights default to `1.0` and behavior matches current release.
+
+## Sampler: StreamWalkUpdater (proposed)
+- `edge_weight_key` (str, default "weight"): column/key name used to read edge weights.
+- `edge_weight_default` (float, default `1.0`): fallback when weight missing or invalid.
+- `weight_exponent` (float, default `1.0`): power γ in `f(w)=w^γ`.
+- `weight_clip` (tuple[float,float] or `None`, default `None`): clamp `f(w)` to `[lo, hi]`.
+- `weight_mode` (enum, default `multiply`): `multiply` | `mix-with-time` | `ignore`.
+- Interaction with decay and beta: weights multiply both transition mass and centrality increments after time decay and before applying `beta`.
+
+## Learner: OnlineWord2Vec / NPWord2Vec (proposed)
+- `use_pair_weights` (bool, default `False`): enable weighted positives.
+- `pair_weight_power` (float, default `1.0`): γ in `α=f(w)=w^γ` (or used with `log(1+w)` if selected).
+- `pair_weight_clip` (tuple[float,float] or `None`, default `None`): clamp `α`.
+- `ns_weight_influence` (float in `[0,1]`, default `0.0`): fraction of weight influence when updating the appearances buffer for negative sampling stats.
+
+## Recommended ranges
+- `weight_exponent`, `pair_weight_power`: 0.5–1.0 (concave) for robustness; 1.0–2.0 to emphasize large weights.
+- `weight_clip`: set to `(0.1, 10.0)` or similar to avoid extremes; `None` to disable.
+- `ns_weight_influence`: 0.0–0.5; start at 0.0 (no effect) and increase cautiously.
+
+## Sampler: StreamWalkUpdater (walk_sampling.StreamWalkUpdater)
+- `half_life` (seconds): exponential decay window. Larger => slower forgetting. Typical: 1 hour to several weeks. Default examples: `7200`, `3*365*86400`.
+- `max_len` (int): maximum walk length. Typical: 2–4. Default: `3`.
+- `beta` (float): damping for long paths (0–1). Lower reduces chance of long hops. Typical: 0.8–0.95. Default: `0.9`.
+- `cutoff` (seconds): drop edges older than cutoff. Balance memory vs. history. Typical: hours to weeks. Default: one week (`604800`).
+- `k` (int): walks/pairs per arriving edge. Higher improves signal but costs compute. Typical: 2–10. Default: `4`.
+- `full_walks` (bool): emit sequences instead of endpoint pairs. Use with learners configured for sequences (`use_pairs=False`, `window>=2`).
+
+## SecondOrderUpdater (optional)
+- `half_life` (seconds): decay for fingerprints; same interpretation.
+- `num_hash` (int): more hashes improve recall; cost grows linearly. Typical: 10–64.
+- `in_edges`, `out_edges` (floats): weights for directed neighborhoods; set to zero to disable side.
+- `incr_condition` (bool): strict matching condition for fingerprints; `True` yields higher-precision pairs, `False` increases recall.
+
+## Learner: OnlineWord2Vec (w2v_learners.OnlineWord2Vec)
+- `embedding_dims` (int): vector size. Typical: 64–256. Default: `128`.
+- `lr_rate` (float): SGD step size. Typical: 0.005–0.05. Default example: `0.035`.
+- `neg_rate` (int): negatives per positive. Typical: 5–20. Default: `10`.
+- `uniform_ratio` (float in [0,1]): fraction of negatives from global distribution vs. sampled-history hard negatives. Higher improves stability; lower can sharpen decision boundaries.
+- `loss` ("square" | "logsigmoid"): squared error or logistic loss for SGNS. Default: `square` in wrapper, `logsigmoid` also available.
+- `mirror` (bool): also train on reversed pairs; helpful for directed graphs to share context.
+- `onlymirror` (bool): train only on reversed order; niche use.
+- `init` ("uniform" | "gensim"): weight initialization scheme.
+- `exportW1` (bool): export input or output matrix. For SGNS, `W1` often used.
+- `interval` (seconds): refresh cadence for negative-sampling distribution; align with stream’s time scale.
+- `temporal_noise` (bool): if true, clears appearance buffer after each refresh to emphasize recency.
+- `window` (int): context window for sequence training. With pairs, kept small (e.g., `2`).
+- `use_pairs` (bool): set `True` for pair inputs (StreamWalk default), `False` for sequence inputs.
+
+## NPWord2Vec (npw2v.NPWord2Vec specifics)
+- `ns_exponent` (float): exponent for unigram distribution of negatives (typical `0.75`).
+- `exportW1` (bool): mirrors wrapper.
+
+## Tuning recommendations
+- Start simple: `k=4`, `embedding_dims=128`, `neg_rate=10`, `lr_rate≈0.02–0.04`, `beta=0.9`, `max_len=3`, `cutoff=1–4 weeks`.
+- Scale compute: increase `k` before increasing `max_len`. Longer walks add latency; extra samples improve robustness with better parallelism.
+- Control forgetting: tune `half_life` first; smaller values adapt faster to regime shifts; larger values preserve long-term structure.
+- Negatives: if embeddings collapse or training is unstable, raise `uniform_ratio` and/or `neg_rate`. If too smooth, lower `uniform_ratio` to use more hard negatives.
+- Loss: `logsigmoid` is standard for SGNS; `square` can be faster but is less calibrated.
+- Mirror: enable if graph is directed but semantics are near-symmetric.
+- Export decay: use `is_decayed=True` if you want inactive nodes to shrink toward the origin at export time.
+
+## Operational tips
+- Ensure edges are time-sorted. Misordered timestamps break decay and snapshot logic.
+- Initialize vocabulary once with all nodes to avoid frequent reallocation; see `scripts/run_online_trainer.py`.
+- Monitor `sum_train_time` and snapshot cadence to balance throughput with export frequency.
+
+## Defaults reference
+- See `scripts/run_online_trainer.py:build_default_components()` for practical default settings.
+

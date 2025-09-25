@@ -1,0 +1,185 @@
+---
+title: Stream Walk Sampling Design
+alwaysApply: false
+---
+
+# Stream Walk Sampling Design
+
+## Summary
+- This document explains the temporal StreamWalk sampler implemented in `online_node2vec/online/walk_sampling.py` as class `StreamWalkUpdater`.
+- It describes how node pairs or full walks are sampled online from an edge stream, how temporal decay and damping are applied, and how cutoff pruning works.
+
+## Components
+- Updater: `StreamWalkUpdater` (entry point: `process_new_edge(src, trg, time)`).
+- Consumers: `OnlineNode2Vec` / `LazyNode2Vec` models feed sampled pairs into learners.
+
+## Core ideas
+- Temporal decay: recent interactions are weighted more using exponential decay with half-life `half_life` seconds. Decay constant is `c = -ln(0.5) / half_life`.
+- Damped random walk: from source node, transitions are sampled along reversed in-edges of the dynamic graph with probability proportional to `(centrality+1) * beta * exp(c * (t_edge - t_curr))`.
+- Early stopping: walk stops if a Bernoulli draw succeeds with probability `1 / (centrality + 1)`, or when no edges are available, or when `max_len` is reached.
+- Cutoff pruning: in-edge lists are pruned to drop edges older than `cutoff` seconds.
+
+## Extensions for edge-weighted learning (ideas not yet implemented)
+## Edge-weighted sampling
+- Purpose: incorporate per-edge weights into StreamWalk so that stronger edges are more likely to be traversed and to influence centrality updates. This is a proposal for future work; current code ignores weights.
+- Transition accumulation (sample_single_walk): In `online_node2vec/online/walk_sampling.py` lines 56–81, the transition accumulator is currently `sum__ += (c+1) * beta * exp(c*(t - time_))`. With weights enabled, this would become `sum__ += f(w) * (c+1) * beta * exp(c*(t - time_))`, where `w` is the edge weight and `f(w)` is a nonnegative transform:
+  - `f(w) = w` (raw weight)
+  - `f(w) = w^γ` with `γ = weight_exponent` (concave/convex emphasis)
+  - `f(w) = log(1 + w)` (diminishing returns)
+  - Normalized weight: min–max or z-score standardization over a sliding window, then clipped to `[weight_clip_min, weight_clip_max]`
+  - Final clipping: apply `weight_clip=(lo, hi)` if set to bound extreme weights
+- Centrality update scaling (update): In `update` (same module), lines around the target centrality increment `self.cent[trg] += (src_cent + 1) * self.beta` and `self.cent_now[trg] += (src_cent + 1) * self.beta` can be scaled by `f(w)` to reflect stronger edges, still under time decay of `src_cent` and `trg`:
+  - Proposed: `+= f(w) * (src_cent + 1) * beta`
+  - Interaction with decay: `src_cent` and `trg` are already decayed to `time`; weighting multiplies the post-decay increment and does not change the decay constant `c`.
+- Modes for time/weight combination:
+  - `multiply` (default): multiply by `f(w)` as above.
+  - `mix-with-time`: convex combination of `f(w)` and the time-decay term, e.g., replace `exp(c*(t-time_))` by `(1-λ)*exp(c*(t-time_)) + λ*f(w)` with `λ∈[0,1]`.
+  - `ignore`: ignore weights (backward compatible current behavior).
+
+## Key parameters
+- `half_life` (int): seconds for exponential time decay; larger means slower forgetting.
+- `max_len` (int): maximum sampled walk length per attempt.
+- `beta` (float): damping factor (down-weights long paths during sampling).
+- `cutoff` (int): ignore edges older than this (seconds) in the in-edge store.
+- `k` (int): number of walks/pairs sampled per arriving edge.
+- `full_walks` (bool): if true, output full walks `[trg] + walk`; else output endpoint pairs `(last_node, trg)`.
+- (Extension) `edge_weight_key` (str, default "weight"): column/key name in the incoming stream for edge weight.
+- (Extension) `edge_weight_default` (float, default `1.0`): fallback weight when the column is missing or null.
+- (Extension) `weight_exponent` (float, default `1.0`): γ in `f(w)=w^γ`.
+- (Extension) `weight_clip` (tuple[float,float] or `None`, default `None`): clamp `f(w)` to `[lo, hi]`.
+- (Extension) `weight_mode` (enum: `multiply` | `mix-with-time` | `ignore`, default `multiply`).
+
+## State maintained
+- `G[trg]`: list of in-edges `(src, time, src_cent)` sorted by arrival; pruned by `cutoff`.
+- `times[node]`: last-seen timestamp per node.
+- `cent[node]`: node centrality proxy, decayed over time and updated online.
+- `cent_now[node]`: per-second accumulator to stabilize concurrent updates.
+- `lens[L]`: histogram of realized walk lengths (1..`max_len`).
+
+## Update flow
+1) New edge `(src, trg, time)` arrives.
+2) Apply decay to `trg` centrality to `time`; compute effective `src_cent` with decay and activity correction.
+3) Update `trg` centrality by `(src_cent + 1) * beta` and record `(src, time, src_cent)` into `G[trg]`.
+4) Prune `G[trg]` and `G[src]` to drop edges older than `cutoff`.
+5) Sample `k` walks via `sample_single_walk` (if `src` reachable); otherwise fall back to `(src, trg)` pairs.
+
+## Sampling step (per walk)
+- Initialize `node_ = src`, `time_ = times[src]`, `cent_ = cent[src]`, `walk = [src]`.
+- Loop until stop:
+  - Stop if `rand < 1/(cent_+1)` or `node_` has no in-edges or `len(walk) >= max_len`.
+  - Draw target sum `sum_ = cent_ * U(0,1)` and scan `reversed(G[node_])` for edges `(n, t, c)` with `t < time_`, accumulating `f(w) * (c+1) * beta * exp(c*(t - time_))` (if weights are enabled; otherwise `f(w)=1`) until surpassing `sum_`; step to that predecessor.
+- Return either pair `(last_node, trg)` or full walk `[trg] + walk` depending on `full_walks`.
+
+## Outputs
+- With `full_walks=False` (default), yields node pairs suitable for skip-gram training.
+- With `full_walks=True`, yields short sequences that can be fed to a windowed learner.
+
+## Usage
+- Construct and pass to an online model:
+  - `from online_node2vec.online.walk_sampling import StreamWalkUpdater`
+  - Example defaults are shown in `scripts/run_online_trainer.py` (`build_default_components`).
+
+## Data expectations
+- Incoming edge stream may optionally include a numeric `weight` field (or a custom key via `edge_weight_key`). If absent, treat `weight=1.0` to preserve current behavior.
+
+## Operational notes
+- Ensure edges are processed in non-decreasing timestamp order.
+- Setting very large `cutoff` increases memory; very small may harm context quality.
+- If the graph is sparse or very fresh, `src not in G` path returns trivial pairs.
+
+## Related
+- Second-order similarity updater is implemented as `SecondOrderUpdater` in the same module; it uses temporal minhash-style fingerprints to emit training pairs.
+
+## Figures
+- Consider linking figures `docs/number_of_walks_and_hash_functions.png` and `docs/half_life.png` when presenting this sampler in reports or READMEs.
+
+## Title: Stream Walk Sampling Design
+
+## Summary
+- This document explains the temporal StreamWalk sampler implemented in `online_node2vec/online/walk_sampling.py` as class `StreamWalkUpdater`.
+- It describes how node pairs or full walks are sampled online from an edge stream, how temporal decay and damping are applied, and how cutoff pruning works.
+
+## Components
+- Updater: `StreamWalkUpdater` (entry point: `process_new_edge(src, trg, time)`).
+- Consumers: `OnlineNode2Vec` / `LazyNode2Vec` models feed sampled pairs into learners.
+
+## Core ideas
+- Temporal decay: recent interactions are weighted more using exponential decay with half-life `half_life` seconds. Decay constant is `c = -ln(0.5) / half_life`.
+- Damped random walk: from source node, transitions are sampled along reversed in-edges of the dynamic graph with probability proportional to `(centrality+1) * beta * exp(c * (t_edge - t_curr))`.
+- Early stopping: walk stops if a Bernoulli draw succeeds with probability `1 / (centrality + 1)`, or when no edges are available, or when `max_len` is reached.
+- Cutoff pruning: in-edge lists are pruned to drop edges older than `cutoff` seconds.
+
+## Extensions for edge-weighted learning (ideas not yet implemented)
+## Edge-weighted sampling
+- Purpose: incorporate per-edge weights into StreamWalk so that stronger edges are more likely to be traversed and to influence centrality updates. This is a proposal for future work; current code ignores weights.
+- Transition accumulation (sample_single_walk): In `online_node2vec/online/walk_sampling.py` lines 56–81, the transition accumulator is currently `sum__ += (c+1) * beta * exp(c*(t - time_))`. With weights enabled, this would become `sum__ += f(w) * (c+1) * beta * exp(c*(t - time_))`, where `w` is the edge weight and `f(w)` is a nonnegative transform:
+  - `f(w) = w` (raw weight)
+  - `f(w) = w^γ` with `γ = weight_exponent` (concave/convex emphasis)
+  - `f(w) = log(1 + w)` (diminishing returns)
+  - Normalized weight: min–max or z-score standardization over a sliding window, then clipped to `[weight_clip_min, weight_clip_max]`
+  - Final clipping: apply `weight_clip=(lo, hi)` if set to bound extreme weights
+- Centrality update scaling (update): In `update` (same module), lines around the target centrality increment `self.cent[trg] += (src_cent + 1) * self.beta` and `self.cent_now[trg] += (src_cent + 1) * self.beta` can be scaled by `f(w)` to reflect stronger edges, still under time decay of `src_cent` and `trg`:
+  - Proposed: `+= f(w) * (src_cent + 1) * beta`
+  - Interaction with decay: `src_cent` and `trg` are already decayed to `time`; weighting multiplies the post-decay increment and does not change the decay constant `c`.
+- Modes for time/weight combination:
+  - `multiply` (default): multiply by `f(w)` as above.
+  - `mix-with-time`: convex combination of `f(w)` and the time-decay term, e.g., replace `exp(c*(t-time_))` by `(1-λ)*exp(c*(t-time_)) + λ*f(w)` with `λ∈[0,1]`.
+  - `ignore`: ignore weights (backward compatible current behavior).
+
+## Key parameters
+- `half_life` (int): seconds for exponential time decay; larger means slower forgetting.
+- `max_len` (int): maximum sampled walk length per attempt.
+- `beta` (float): damping factor (down-weights long paths during sampling).
+- `cutoff` (int): ignore edges older than this (seconds) in the in-edge store.
+- `k` (int): number of walks/pairs sampled per arriving edge.
+- `full_walks` (bool): if true, output full walks `[trg] + walk`; else output endpoint pairs `(last_node, trg)`.
+- (Extension) `edge_weight_key` (str, default "weight"): column/key name in the incoming stream for edge weight.
+- (Extension) `edge_weight_default` (float, default `1.0`): fallback weight when the column is missing or null.
+- (Extension) `weight_exponent` (float, default `1.0`): γ in `f(w)=w^γ`.
+- (Extension) `weight_clip` (tuple[float,float] or `None`, default `None`): clamp `f(w)` to `[lo, hi]`.
+- (Extension) `weight_mode` (enum: `multiply` | `mix-with-time` | `ignore`, default `multiply`).
+
+## State maintained
+- `G[trg]`: list of in-edges `(src, time, src_cent)` sorted by arrival; pruned by `cutoff`.
+- `times[node]`: last-seen timestamp per node.
+- `cent[node]`: node centrality proxy, decayed over time and updated online.
+- `cent_now[node]`: per-second accumulator to stabilize concurrent updates.
+- `lens[L]`: histogram of realized walk lengths (1..`max_len`).
+
+## Update flow
+1) New edge `(src, trg, time)` arrives.
+2) Apply decay to `trg` centrality to `time`; compute effective `src_cent` with decay and activity correction.
+3) Update `trg` centrality by `(src_cent + 1) * beta` and record `(src, time, src_cent)` into `G[trg]`.
+4) Prune `G[trg]` and `G[src]` to drop edges older than `cutoff`.
+5) Sample `k` walks via `sample_single_walk` (if `src` reachable); otherwise fall back to `(src, trg)` pairs.
+
+## Sampling step (per walk)
+- Initialize `node_ = src`, `time_ = times[src]`, `cent_ = cent[src]`, `walk = [src]`.
+- Loop until stop:
+  - Stop if `rand < 1/(cent_+1)` or `node_` has no in-edges or `len(walk) >= max_len`.
+  - Draw target sum `sum_ = cent_ * U(0,1)` and scan `reversed(G[node_])` for edges `(n, t, c)` with `t < time_`, accumulating `f(w) * (c+1) * beta * exp(c*(t - time_))` (if weights are enabled; otherwise `f(w)=1`) until surpassing `sum_`; step to that predecessor.
+- Return either pair `(last_node, trg)` or full walk `[trg] + walk` depending on `full_walks`.
+
+## Outputs
+- With `full_walks=False` (default), yields node pairs suitable for skip-gram training.
+- With `full_walks=True`, yields short sequences that can be fed to a windowed learner.
+
+## Usage
+- Construct and pass to an online model:
+  - `from online_node2vec.online.walk_sampling import StreamWalkUpdater`
+  - Example defaults are shown in `scripts/run_online_trainer.py` (`build_default_components`).
+
+## Data expectations
+- Incoming edge stream may optionally include a numeric `weight` field (or a custom key via `edge_weight_key`). If absent, treat `weight=1.0` to preserve current behavior.
+
+## Operational notes
+- Ensure edges are processed in non-decreasing timestamp order.
+- Setting very large `cutoff` increases memory; very small may harm context quality.
+- If the graph is sparse or very fresh, `src not in G` path returns trivial pairs.
+
+## Related
+- Second-order similarity updater is implemented as `SecondOrderUpdater` in the same module; it uses temporal minhash-style fingerprints to emit training pairs.
+
+## Figures
+- Consider linking figures `docs/number_of_walks_and_hash_functions.png` and `docs/half_life.png` when presenting this sampler in reports or READMEs.
+

@@ -1,0 +1,90 @@
+---
+title: Overview of online node2vec
+alwaysApply: false
+---
+
+# Online Node2Vec Project Overview
+
+This repository implements an online, streaming variant of the Node2Vec algorithm that can incrementally update node embeddings as the underlying graph evolves.
+
+
+## What you will find in this repo
+
+| Path | Key contents | Responsibilities |
+|------|--------------|------------------|
+| `online_node2vec/online/` | `walk_sampling.py`, `online_node2vec_models.py`, `w2v_learners.py`, `npw2v.py`, `hash_utils.py` | Core online engine: streaming walk generators, incremental Node2Vec classes, word2vec learners, and fast hashing utilities. |
+| `online_node2vec/offline/` | `node2vec.py`, `offline_node2vec_model.py` | Batch Node2Vec baseline for ablation and sanity checks. |
+| `online_node2vec/evaluation/` | `distance_computer.py`, `ndcg_computer.py` | Metric computation helpers (cosine distance, nDCG, etc.). |
+| `online_node2vec/data/` | `tennis_handler.py`, `n2v_embedding_handler.py` | Dataset loading, preprocessing, and embedding I/O routines. |
+| `scripts/` | `streamwalk_runner.py`, `second_order_runner.py`, `offline_n2v_runner.py`, `evaluate.py`, `preprocess_data.py`, `run.sh` | Command-line entry points for training, evaluation, and data prep. |
+| `tests/` | Various test modules | Unit & integration tests covering algorithms, learners, and helpers. |
+| `docs/` | Paper PDFs, slides, figures | Research documentation and supplementary material. |
+| `.cursor/rules/` | `overview.mdc` (this file) | Cursor rules and project-level guidelines. |
+| `setup.py`, `setup.cfg` | Packaging metadata | Editable installation & dependency definitions. |
+| `README.md` | — | High-level project description and basic usage instructions. |
+
+---
+
+## Quick start
+
+1. Install dependencies (editable mode is handy while developing):
+
+```bash
+pip install -e .
+```
+
+2. Run the test-suite to ensure everything is set up correctly:
+
+```bash
+pytest
+```
+
+3. Launch a small example experiment:
+
+```bash
+python scripts/run_example.py --graph data/sample.edgelist --embedding-dim 128 --epochs 5
+```
+
+---
+
+## Project philosophy
+
+• **Online / incremental** – handle evolving graphs without full retraining.
+• **Reproducible research** – version-controlled experiments and tests.
+• **Typed & documented** – we aim for type hints and inline docs everywhere.
+
+---
+
+## Main components & responsibilities
+
+### Online engine (`online_node2vec/online/`)
+- `Node2VecBase`, `LazyNode2Vec`, `OnlineNode2Vec`: encapsulate incremental node-embedding logic, handling negative sampling, optimizer state, and checkpointing.
+- `StreamWalkUpdater`, `SecondOrderUpdater`: maintain reservoirs / caches of random walks as new edges arrive, enabling efficient context generation for training.
+- `Word2VecBase`, `OnlineWord2Vec`, `GensimWord2Vec`, `NPWord2Vec`: interchangeable learners that consume walks and update embeddings using custom NumPy or Gensim back-ends.
+- Hash helpers (`ModHashGenerator`, `MapHashGenerator`, `MulHashGenerator`): universal hash functions for fast, reproducible indexing when streaming.
+
+Note on extensions: The online path is being designed to optionally support edge weights in both sampling and training. See `online_walk_sampling.mdc` (Edge-weighted sampling) and `online_training_npw2v.mdc` (Weighted positive pairs) for proposed designs. Current implementation treats all weights as `1.0`.
+
+### Offline baseline (`online_node2vec/offline/`)
+- `Graph`, `BatchNode2Vec`: classic batch Node2Vec implementation used for ablation and performance comparisons.
+
+### Evaluation utilities (`online_node2vec/evaluation/`)
+- `DistanceComputer`, `NDCGComputer`: compute pairwise cosine distances and nDCG scores for downstream link-prediction / ranking tasks.
+
+### Data helpers (`online_node2vec/data/`)
+- `TennisHandler`: parses the tennis-match event stream dataset used in the paper.
+- `N2VEmbeddingHandler`: read / write embeddings in the original Node2Vec text format.
+
+Data schema (extensions)
+- Input CSVs may include a numeric `weight` column (or a custom name configured via `edge_weight_key`). If absent, edges are treated as `weight=1.0`.
+
+### Command-line helpers (`scripts/`)
+- Runners: `streamwalk_runner.py`, `second_order_runner.py`, `offline_n2v_runner.py` launch experiments for each training mode.
+- `evaluate.py`: wraps the evaluation pipeline.
+- `preprocess_data.py`: converts raw graph data into the edgelist format expected by the runners.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE` for full details.

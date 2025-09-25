@@ -1,0 +1,99 @@
+---
+title: Online Training (NPW2V + Learners)
+alwaysApply: false
+---
+
+# Online Training (NPW2V + Learners)
+
+## Summary
+- Describes the online training stack that consumes sampled pairs/sequences and updates embeddings incrementally.
+- Focuses on the custom NumPy learner `NPWord2Vec` and its wrapper `OnlineWord2Vec`, and how they integrate with the `OnlineNode2Vec` training loop.
+
+## Components
+- Learner core: `online_node2vec/online/npw2v.py` -> class `NPWord2Vec`.
+- Wrapper: `online_node2vec/online/w2v_learners.py` -> class `OnlineWord2Vec`.
+- Orchestrator: `online_node2vec/online/online_node2vec_models.py` -> `OnlineNode2Vec` / `LazyNode2Vec`.
+- Convenience trainer: `scripts/online_trainer.py` (`OnlineNode2VecTrainer`).
+
+## Training data expectations
+- Input is either
+  - node pairs `(src, trg)` (use `use_pairs=True`), or
+  - short node sequences (full walks) (use `use_pairs=False`, `window>=2`).
+- Vocabulary must be set before the first update: `OnlineWord2Vec.set_all_words(list_of_node_ids_as_strings)`.
+
+## NPWord2Vec: Model and updates
+- Embedding matrices: `W1` (input) and `W2` (output). If `exportW1=True`, `W1` is exported.
+- Initialization:
+  - `init='gensim'`: `W1 ~ U(-0.5, 0.5)/d`, `W2 = 0`.
+  - `init='uniform'`: both `W1`, `W2 ~ U(-0.5, 0.5)/100`.
+- Negative sampling:
+  - `negative_rate` negatives per positive.
+  - Mixture controlled by `uniform_ratio` in `[0,1]`:
+    - fraction `uniform_ratio` drawn from global (or available) unigram^`ns_exponent` distribution.
+    - remainder from recently sampled positives (`sampled` graph) for hard negatives.
+- Losses:
+  - `logsigmoid`: skip-gram with negative sampling using logistic loss (`expit`), gradient `(neg_ref - sigmoid(scores))*lr`.
+  - `square`: squared error on dot products.
+- Windowed training for sequences: `train_sentence` collects context pairs within a random-reduced window (unless `window==2`).
+- Pair training: `train_pairs` feeds `(s1,s2)` and optionally mirrored orders.
+
+## Extensions for edge-weighted learning (ideas not yet implemented)
+## Weighted positive pairs
+- Goal: allow positive pair updates to be scaled by a per-pair scalar `α = f(w)` computed from the edge weight `w`. Current implementation treats all positives equally.
+- Where positives are consumed: see `online_node2vec/online/npw2v.py`, lines 90–111 (`train_pair` calling `do_update_logsigmoid` or `do_update_squared`).
+- Implementation options:
+  - (A) Gradient scaling (preferred): multiply the update factor `gb` by `α`.
+    - Logistic loss: `gb = α * (neg_ref - sigmoid(scores)) * lr` in `do_update_logsigmoid`.
+    - Squared loss: `gb = α * (neg_ref - scores) * lr` in `do_update_squared`.
+  - (B) Integer replication: replicate the positive pair approximately `round(α)` times (or via Poisson sampling). This is less efficient and introduces variance; option (A) is recommended.
+- Weight transform `f(w)` follows the sampler’s definitions: raw `w`, power `w^γ`, `log(1+w)`, optionally normalized and clipped to `[pair_weight_clip]`.
+
+## Negative sampling and weights
+- The positive edge weight does not directly increase the probability of drawing the same positive as a negative. Negative sampling distribution remains driven by unigram^`ns_exponent` and the `sampled/seen` buffers.
+- Optional extension: let the appearances buffer that feeds `update_noise_dist` record counts proportional to `f(w)` (e.g., increment by `α` instead of `1`), controlled by `ns_weight_influence ∈ [0,1]`.
+
+## API changes (proposed)
+- `OnlineWord2Vec.partial_fit` may accept items of shape `(src, trg, weight)` when `use_pair_weights=True`; otherwise it expects `(src, trg)`.
+- `NPWord2Vec.train_pairs` accepts optional `pair_weights: Optional[List[float]]` aligned with `pairs`.
+- New configuration knobs:
+  - `use_pair_weights` (bool, default `False`)
+  - `pair_weight_power` (float, default `1.0`)
+  - `pair_weight_clip` (tuple[float,float] or `None`, default `None`)
+  - `ns_weight_influence` (float in `[0,1]`, default `0.0`)
+
+## Example (proposed)
+```python
+# Sampler emits pairs with weights; trainer forwards them to the learner
+online = OnlineNode2Vec(..., use_pairs=True)
+# time t is the current timestamp
+online.learner.partial_fit([("u", "v", 3.0)], t)  # weight=3.0 → α=f(3.0)
+```
+Flow: `partial_fit` passes `(u,v)` and `α` into `NPWord2Vec.train_pairs(..., pair_weights=[α])`, which scales gradients as above.
+
+## OnlineWord2Vec: Wrapper behavior
+- Parameters: `embedding_dims`, `lr_rate`, `neg_rate`, `uniform_ratio`, `loss`, `mirror`, `onlymirror`, `init`, `exportW1`, `interval`, `temporal_noise`, `window`, `use_pairs`.
+- Initialization on first call to `partial_fit(time)` sets up `NPWord2Vec` and vocabulary.
+- Maintains `appearences` buffer to periodically refresh the negative-sampling distribution every `interval` seconds. If `temporal_noise=True`, clears the buffer after refresh.
+- `partial_fit(sentences, time)` routes to `train_pairs` (pairs) or `train_sentence` (sequences) and updates appearances for noise stats.
+- `add_edge(src, trg, time)` keeps an auxiliary `seen` graph that influences negative sampling.
+
+## OnlineNode2Vec: Integration
+- At each incoming edge `(src, trg, ts)`:
+  1) Updater emits training items (pairs/sequences).
+  2) `online_train_model(pairs, ts)` calls `learner.partial_fit`.
+  3) `learner.add_edge(src, trg, ts)` updates the seen graph for negatives.
+- Snapshotting: embeddings can be exported at snapshot boundaries (see `export_features`); optional temporal decay is applied at export time if `is_decayed=True`.
+
+## Exporting embeddings
+- `OnlineWord2Vec.get_embeddings()` returns a DataFrame `[index=node_id, dim_0, ... dim_{d-1}]`.
+- `Word2VecBase.export_embeddings(file_name, nbunch, decay_information)` can apply time decay per node at export using snapshot time and last-seen timestamps.
+
+## Practical tips
+- Set `use_pairs=True` with a sampler that emits pairs (e.g., `StreamWalkUpdater`). Use `use_pairs=False` only with full-walk samplers.
+- For stability, initialize vocabulary with all nodes present in the edge batch before the first `partial_fit`.
+- `mirror=True` often helps on directed graphs; `onlymirror=True` is a specialized option.
+- Keep `interval` aligned with time units of your stream to ensure periodic refresh of the noise distribution.
+
+## Example (from scripts)
+- See `scripts/run_online_trainer.py:build_default_components()` for a ready-to-use configuration and end-to-end usage.
+
