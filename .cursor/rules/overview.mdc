@@ -1,6 +1,6 @@
 ---
 title: Overview of online node2vec
-alwaysApply: false
+alwaysApply: true
 ---
 
 # Online Node2Vec Project Overview
@@ -63,7 +63,14 @@ python scripts/run_example.py --graph data/sample.edgelist --embedding-dim 128 -
 - `Word2VecBase`, `OnlineWord2Vec`, `GensimWord2Vec`, `NPWord2Vec`: interchangeable learners that consume walks and update embeddings using custom NumPy or Gensim back-ends.
 - Hash helpers (`ModHashGenerator`, `MapHashGenerator`, `MulHashGenerator`): universal hash functions for fast, reproducible indexing when streaming.
 
-Note on extensions: The online path is being designed to optionally support edge weights in both sampling and training. See `online_walk_sampling.mdc` (Edge-weighted sampling) and `online_training_npw2v.mdc` (Weighted positive pairs) for proposed designs. Current implementation treats all weights as `1.0`.
+Edge weights: The online path now supports per-edge weights in StreamWalk sampling. `StreamWalkUpdater` accepts an optional `weight_fn` transform and runners pass `row["weight"]` when present; otherwise weights default to `1.0`. Weights scale both the online centrality recursion and the backward sampling kernel.
+
+Key details (implemented):
+- Sampler updates: the per-event increment to `cent[trg]` is multiplied by `f(w)`; the in-edge sampling accumulator also multiplies each term by `f(w)`.
+- State: in-edge log stores `(src, time, src_cent, weight)`; legacy 3-tuples are treated as `weight=1.0` for backward compatibility.
+- Usage: include a numeric `weight` column in your edge DataFrame/CSV or provide `weight_fn` (e.g., clipped power or log transform). If absent/invalid, `weight=1.0` is assumed.
+
+Learner weighting: positive-pair gradient weighting remains optional and is not required; current learners consume the reweighted pair distribution produced by the sampler.
 
 ### Offline baseline (`online_node2vec/offline/`)
 - `Graph`, `BatchNode2Vec`: classic batch Node2Vec implementation used for ablation and performance comparisons.
@@ -82,6 +89,7 @@ Data schema (extensions)
 - Runners: `streamwalk_runner.py`, `second_order_runner.py`, `offline_n2v_runner.py` launch experiments for each training mode.
 - `evaluate.py`: wraps the evaluation pipeline.
 - `preprocess_data.py`: converts raw graph data into the edgelist format expected by the runners.
+ - `run_online_trainer.py`: consumes an edge CSV with required `src,trg,time` and optional `weight` column; if present, weights are forwarded to the sampler.
 
 ---
 

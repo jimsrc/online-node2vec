@@ -1,5 +1,4 @@
 import random
-import pandas as pd
 import numpy as np
 from .hash_utils import ModHashGenerator
 
@@ -22,7 +21,7 @@ class StreamWalkUpdater():
     full_walks: bool
         Return every node of the sampled walk for representation learning (full_walks=True) or only the endpoints of the walk (full_walks=False)
     """
-    def __init__(self, half_life=7200,  max_len=3, beta=0.9, cutoff=604800, k=4, full_walks=False):
+    def __init__(self, half_life=7200,  max_len=3, beta=0.9, cutoff=604800, k=4, full_walks=False, weight_fn=None):
         self.c = - np.log(0.5) / half_life
         self.beta = beta
         self.half_life = half_life
@@ -30,6 +29,10 @@ class StreamWalkUpdater():
         self.cutoff  = cutoff
         self.max_len = max_len
         self.full_walks = full_walks
+        # weight transform function; defaults to identity (no weighting)
+        if weight_fn is not None:
+            print(f"[*] Using provided edge-weight transform function ({weight_fn})")
+        self.f = (weight_fn if weight_fn is not None else (lambda w: 1.0))
         self.G = {}
         self.times = {}
         self.cent = {}
@@ -41,8 +44,8 @@ class StreamWalkUpdater():
     def __str__(self):
         return "streamwalk_hl%i_ml%i_beta%.2f_cutoff%i_k%i_fullw%s" % (self.half_life, self.max_len, self.beta, self.cutoff, self.k, self.full_walks)
 
-    def process_new_edge(self, src, trg, time):
-        self.update(src, trg, time)
+    def process_new_edge(self, src, trg, time, weight=1.0):
+        self.update(src, trg, time, weight)
         return self.sample_node_pairs(src, trg, time, self.k)
         
     def sample_node_pairs (self, src, trg, time, sample_num):
@@ -64,9 +67,9 @@ class StreamWalkUpdater():
             sum_ = cent_ * random.uniform(0, 1)
             sum__ = 0
             broken = False
-            for (n, t, c) in reversed(self.G[node_]):
+            for (n, t, c, w) in reversed(self.G[node_]):
                 if t < time_:
-                    sum__ += (c + 1) * self.beta * np.exp(self.c * (t - time_))
+                    sum__ += self.f(w) * (c + 1) * self.beta * np.exp(self.c * (t - time_))
                     if sum__ >= sum_:
                         broken = True
                         break
@@ -80,7 +83,7 @@ class StreamWalkUpdater():
         else:
             return (node_,trg)
 
-    def update(self, src, trg, time):
+    def update(self, src, trg, time, weight=1.0):
         # apply time decay for trg
         if trg in self.cent:
             self.cent[trg] = self.cent[trg] * np.exp(self.c * (self.times[trg] - time))
@@ -99,22 +102,23 @@ class StreamWalkUpdater():
             else:
                 # if src is currently active then adjust centrality
                 src_cent = src_cent - self.cent_now[src]
-        self.cent[trg] += (src_cent + 1) * self.beta
+        fw = self.f(weight)
+        self.cent[trg] += fw * (src_cent + 1) * self.beta
         if (trg not in self.times) or (self.times[trg] < time):
             # cent_now is initialized for each node in each second
             self.cent_now[trg] = 0
-        self.cent_now[trg] += (src_cent + 1) * self.beta
+        self.cent_now[trg] += fw * (src_cent + 1) * self.beta
         # collect recent edges for each vertex
         if trg not in self.G:
             self.G[trg] = []
-        self.G[trg].append((src, time, src_cent))
+        self.G[trg].append((src, time, src_cent, weight))
         self.times[trg] = time
         # clean in egdes
         self.clean_in_edges(trg, time)
     
     def clean_in_edges(self, node, time):
         ii = 0
-        for (s, t, c) in self.G[node]:
+        for (s, t, c, w) in self.G[node]:
             if time - t < self.cutoff:
                 break
             ii += 1

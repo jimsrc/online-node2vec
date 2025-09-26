@@ -4,6 +4,10 @@ import numpy as np
 from .w2v_learners import OnlineWord2Vec
 from .walk_sampling import *
 
+
+def is_valid_weight(weight):
+    return not pd.isna(weight) and not np.isinf(weight) and (weight is not None)
+
 class Node2VecBase():
     def __init__(self, updater, learner, is_decayed):
         self.updater = updater
@@ -126,7 +130,12 @@ class LazyNode2Vec(Node2VecBase):
             self.node_last_update[source] = current_time
             self.node_last_update[target] = current_time
             # update & sample node pairs for model training
-            new_pairs = self.updater.process_new_edge(source, target, current_time)
+            if not is_valid_weight(row["weight"]):
+                print(f"[!] Weight is invalid ({row['weight']}). Setting weight to 1.0")
+                weight = 1.0
+            else:
+                weight = float(row["weight"])
+            new_pairs = self.updater.process_new_edge(source, target, current_time, weight)
             self.sampled_pairs += new_pairs
         # lazy learning
         self.lazy_train_model(current_time)
@@ -186,6 +195,11 @@ class OnlineNode2Vec(Node2VecBase):
         start_epoch = int(time.time())
         last_snapshot_epoch, snapshot_idx = start_time, 0
         self.sum_train_time = 0.0
+        # check if weight column exists
+        if "weight" not in partial_data.columns:
+            print("[!] No weight column found in the edge data. Setting all weights to 1.0")
+            partial_data["weight"] = 1.0
+            
         print("Experiment was STARTED")
         for edge_num, row in partial_data.iterrows():
             current_time, source, target = row["time"], str(int(row["src"])), str(int(row["trg"]))
@@ -198,7 +212,12 @@ class OnlineNode2Vec(Node2VecBase):
             self.node_last_update[source] = current_time
             self.node_last_update[target] = current_time
             # update & sample node pairs for model training
-            new_pairs = self.updater.process_new_edge(source, target, current_time)
+            if not is_valid_weight(row["weight"]):
+                print(f"[!] Weight is invalid ({row['weight']}). Setting weight to 1.0")
+                weight = 1.0
+            else:
+                weight = float(row["weight"])
+            new_pairs = self.updater.process_new_edge(source, target, current_time, weight)
             self.online_train_model(new_pairs, current_time)
             # update seen graph for npw2v model
             self.learner.add_edge(source, target, current_time)
